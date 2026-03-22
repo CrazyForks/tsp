@@ -25,6 +25,12 @@ Installing the TSP CLI program:
 cargo install --git https://github.com/openwallet-foundation-labs/tsp.git examples --bin tsp
 ```
 
+To include the optional `bench` subcommand:
+
+```sh
+cargo install --git https://github.com/openwallet-foundation-labs/tsp.git examples --bin tsp --features bench
+```
+
 **Note:** If you clone the whole repository instead and want to build or test everything in there, you need a working Python
 installation on your system, because it includes language bindings for Python and JavaScript. Please refer to 
 the [Python Section](../python.md#tsp-python-bindings) for more information.
@@ -59,7 +65,6 @@ Commands:
   accept      accept a relationship
   cancel      break up a relationship
   secret      manage custom secret data
-  bench       run transport benchmark tests
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -72,4 +77,10 @@ Options:
   -h, --help                     Print help
   -V, --version                  Print version
 
+```
+
+If the CLI is installed or built with `--features bench`, the help output also includes:
+
+```text
+  bench       run transport benchmark traffic tests
 ```
