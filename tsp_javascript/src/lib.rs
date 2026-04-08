@@ -11,6 +11,15 @@ impl From<Error> for JsValue {
     }
 }
 
+fn parse_thread_id(thread_id: &[u8]) -> Result<[u8; 32], tsp_sdk::Error> {
+    thread_id.try_into().map_err(|_| {
+        tsp_sdk::Error::Relationship(format!(
+            "thread_id must be exactly 32 bytes, got {}",
+            thread_id.len()
+        ))
+    })
+}
+
 #[derive(Default, Clone)]
 #[wasm_bindgen]
 pub struct Store(tsp_sdk::SecureStore);
@@ -134,13 +143,14 @@ impl Store {
         route: Option<Vec<String>>,
     ) -> Result<SealedMessage, Error> {
         let route_items: Vec<&str> = route.iter().flatten().map(|s| s.as_str()).collect();
+        let thread_id = parse_thread_id(&thread_id).map_err(Error)?;
 
         let (url, sealed) = self
             .0
             .make_relationship_accept(
                 &sender,
                 &receiver,
-                thread_id.try_into().unwrap(),
+                thread_id,
                 route.as_ref().map(|_| route_items.as_slice()),
             )
             .map_err(Error)?;
@@ -176,13 +186,10 @@ impl Store {
         receiver_new_vid: String,
         thread_id: Vec<u8>,
     ) -> Result<SealedMessage, Error> {
+        let thread_id = parse_thread_id(&thread_id).map_err(Error)?;
         let (url, sealed) = self
             .0
-            .make_parallel_relationship_accept(
-                &sender_new_vid,
-                &receiver_new_vid,
-                thread_id.try_into().unwrap(),
-            )
+            .make_parallel_relationship_accept(&sender_new_vid, &receiver_new_vid, thread_id)
             .map_err(Error)?;
 
         Ok(SealedMessage {
@@ -233,9 +240,10 @@ impl Store {
         receiver: String,
         thread_id: Vec<u8>,
     ) -> Result<NestedSealedMessage, Error> {
+        let thread_id = parse_thread_id(&thread_id).map_err(Error)?;
         let ((url, sealed), vid) = self
             .0
-            .make_nested_relationship_accept(&sender, &receiver, thread_id.try_into().unwrap())
+            .make_nested_relationship_accept(&sender, &receiver, thread_id)
             .map_err(Error)?;
 
         Ok(NestedSealedMessage {
@@ -754,5 +762,26 @@ impl From<tsp_sdk::ReceivedTspMessage> for FlatReceivedTspMessage {
         };
 
         this
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_thread_id;
+
+    #[test]
+    fn parse_thread_id_accepts_32_bytes() {
+        let thread_id = [7_u8; 32];
+        assert_eq!(parse_thread_id(&thread_id).unwrap(), thread_id);
+    }
+
+    #[test]
+    fn parse_thread_id_rejects_wrong_length() {
+        let error = parse_thread_id(&[7_u8; 31]).unwrap_err();
+        assert!(matches!(error, tsp_sdk::Error::Relationship(_)));
+        assert_eq!(
+            error.to_string(),
+            "Relationship Error: thread_id must be exactly 32 bytes, got 31"
+        );
     }
 }
