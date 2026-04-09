@@ -2,17 +2,21 @@ use axum::{
     Router,
     body::Bytes,
     extract::{Path, State, WebSocketUpgrade, ws::Message},
-    http::StatusCode,
-    response::{Html, IntoResponse, Response},
+    http::{HeaderMap, StatusCode},
+    response::{
+        Html, IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
+use base64ct::{Base64UrlUnpadded, Encoding};
 use bytes::BytesMut;
 use clap::Parser;
-use futures::{sink::SinkExt, stream::StreamExt};
+use futures::{sink::SinkExt, stream::Stream, stream::StreamExt};
 use reqwest::header;
 use serde::Serialize;
-use std::{collections::VecDeque, sync::Arc};
-use tokio::sync::{Notify, RwLock, RwLockWriteGuard, broadcast};
+use std::{collections::{HashMap, VecDeque}, convert::Infallible, sync::Arc, time::{Duration, Instant}};
+use tokio::sync::{Mutex, Notify, RwLock, RwLockWriteGuard, broadcast, mpsc};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tsp_sdk::{
     AsyncSecureStore, OwnedVid, ReceivedTspMessage, VerifiedVid, cesr, definitions::Digest,
@@ -36,6 +40,105 @@ struct Cli {
     domain: String,
 }
 
+/// A buffered message waiting for delivery via SSE.
+#[derive(Clone)]
+struct BufferedMessage {
+    /// Monotonic ID per recipient (for Last-Event-ID replay)
+    id: u64,
+    /// The raw CESR-encoded TSP message
+    data: Bytes,
+    /// When this message was buffered (for TTL expiry)
+    timestamp: Instant,
+}
+
+/// Per-recipient message buffer with monotonic ID assignment.
+struct RecipientBuffer {
+    next_id: u64,
+    messages: VecDeque<BufferedMessage>,
+}
+
+impl RecipientBuffer {
+    fn new() -> Self {
+        Self {
+            next_id: 0,
+            messages: VecDeque::new(),
+        }
+    }
+
+    /// Add a message and return its assigned ID.
+    fn push(&mut self, data: Bytes) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.messages.push_back(BufferedMessage {
+            id,
+            data,
+            timestamp: Instant::now(),
+        });
+        // Trim if over max size
+        while self.messages.len() > MAX_BUFFER_PER_RECIPIENT {
+            self.messages.pop_front();
+        }
+        id
+    }
+
+    /// Get all messages after a given ID (for Last-Event-ID replay).
+    fn messages_after(&self, after_id: Option<u64>) -> Vec<BufferedMessage> {
+        match after_id {
+            Some(id) => self.messages.iter()
+                .filter(|m| m.id > id)
+                .cloned()
+                .collect(),
+            None => self.messages.iter().cloned().collect(),
+        }
+    }
+
+    /// Remove messages older than TTL.
+    fn expire(&mut self, ttl: Duration) {
+        self.messages.retain(|m| m.timestamp.elapsed() < ttl);
+    }
+}
+
+/// Registry of SSE subscribers per recipient DID.
+/// When a message arrives for a DID, only that DID's subscribers are notified.
+struct SseSubscribers {
+    /// Map from recipient DID to list of notification senders
+    senders: HashMap<String, Vec<mpsc::Sender<u64>>>,
+}
+
+impl SseSubscribers {
+    fn new() -> Self {
+        Self { senders: HashMap::new() }
+    }
+
+    /// Register a new SSE client for a DID. Returns a receiver for notifications.
+    fn subscribe(&mut self, did: &str) -> mpsc::Receiver<u64> {
+        let (tx, rx) = mpsc::channel(64);
+        self.senders.entry(did.to_string()).or_default().push(tx);
+        rx
+    }
+
+    /// Notify all SSE clients for a DID that a new message is available.
+    fn notify(&mut self, did: &str, msg_id: u64) {
+        if let Some(senders) = self.senders.get_mut(did) {
+            // Remove closed channels (client disconnected)
+            senders.retain(|tx| !tx.is_closed());
+            for tx in senders.iter() {
+                let _ = tx.try_send(msg_id);
+            }
+        }
+    }
+
+    /// Clean up empty entries.
+    fn cleanup(&mut self) {
+        self.senders.retain(|_, v| {
+            v.retain(|tx| !tx.is_closed());
+            !v.is_empty()
+        });
+    }
+}
+
+// Legacy: keep for WebSocket-based message forwarding (used by broadcast for
+// the old WebSocket handler, log viewer, etc.)
 #[derive(Clone)]
 struct QueuedWsMessage {
     receiver: String,
@@ -57,7 +160,13 @@ struct IntermediaryState {
     domain: String,
     did: String,
     db: RwLock<AsyncSecureStore>,
+    /// Per-recipient message buffers with monotonic IDs
+    buffers: RwLock<HashMap<String, RecipientBuffer>>,
+    /// Per-recipient SSE subscriber notifications
+    subscribers: Mutex<SseSubscribers>,
+    /// Legacy: broadcast for WebSocket handlers (log viewer, backward compat)
     message_tx: broadcast::Sender<QueuedWsMessage>,
+    /// Legacy: old flat buffer (kept for backward compat during transition)
     message_buffer: RwLock<VecDeque<QueuedWsMessage>>,
     log: RwLock<VecDeque<LogEntry>>,
     log_tx: broadcast::Sender<String>,
@@ -124,6 +233,9 @@ impl IntermediaryState {
 
 const MAX_LOG_LEN: usize = 10;
 const MAX_BUFFER_LEN: usize = 100;
+const MAX_BUFFER_PER_RECIPIENT: usize = 200;
+const BUFFER_TTL_SECS: u64 = 300; // 5 minutes
+const SSE_KEEPALIVE_SECS: u64 = 15;
 
 #[tokio::main]
 async fn main() {
@@ -155,17 +267,42 @@ async fn main() {
         domain: args.domain.to_owned(),
         did,
         db: RwLock::new(db),
+        buffers: RwLock::new(HashMap::new()),
+        subscribers: Mutex::new(SseSubscribers::new()),
         message_tx: broadcast::channel(100).0,
         message_buffer: RwLock::new(VecDeque::with_capacity(100)),
         log: RwLock::new(VecDeque::with_capacity(MAX_LOG_LEN)),
         log_tx: broadcast::channel(100).0,
     });
 
+    // Spawn buffer cleanup task
+    {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let ttl = Duration::from_secs(BUFFER_TTL_SECS);
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let mut buffers = state.buffers.write().await;
+                for (_, buf) in buffers.iter_mut() {
+                    buf.expire(ttl);
+                }
+                buffers.retain(|_, buf| !buf.messages.is_empty());
+
+                // Also cleanup subscriber entries for disconnected clients
+                state.subscribers.lock().await.cleanup();
+            }
+        });
+    }
+
     // Compose the routes
     let app = Router::new()
         .route("/", get(index))
-        .route("/transport/{did}", post(new_message).get(websocket_handler))
-        .route("/endpoint/{did}", post(new_message).get(websocket_handler))
+        .route("/transport/{did}", post(new_message).get(sse_handler))
+        .route("/endpoint/{did}", post(new_message).get(sse_handler))
+        .route("/messages/{did}", get(sse_handler))
+        // Legacy WebSocket endpoint for backward compatibility
+        .route("/ws/transport/{did}", get(websocket_handler))
+        .route("/ws/endpoint/{did}", get(websocket_handler))
         .route(
             "/.well-known/did.json",
             get(async || ([(header::CONTENT_TYPE, "application/json")], did_doc)),
@@ -226,21 +363,33 @@ async fn new_message(
     // yes, this must be a separate variable https://github.com/rust-lang/rust/issues/37612
     let message_is_for_me = matches!(state.db.read().await.has_private_vid(&receiver), Ok(true));
     if !message_is_for_me {
-        // message is not for the intermediary, can't open, so try forwarding via WebSockets instead
+        // Message is not for the intermediary — buffer it for delivery via SSE
+        let msg_bytes: Bytes = message.freeze();
+
         state
             .log(format!(
-                "Forwarding message from  {sender} to {receiver} via WebSockets ({} bytes)",
-                message.len()
+                "Forwarding message from {sender} to {receiver} via SSE ({} bytes)",
+                msg_bytes.len()
             ))
             .await;
 
-        let queued_message = QueuedWsMessage::new(message, receiver);
+        // Store in per-recipient buffer with monotonic ID
+        let msg_id = {
+            let mut buffers = state.buffers.write().await;
+            let buf = buffers.entry(receiver.clone()).or_insert_with(RecipientBuffer::new);
+            buf.push(msg_bytes.clone())
+        };
+
+        // Notify SSE subscribers for this recipient
+        state.subscribers.lock().await.notify(&receiver, msg_id);
+
+        // Also push to legacy WebSocket broadcast (backward compat)
+        let queued_message = QueuedWsMessage::new(msg_bytes, receiver);
         let mut buffer = state.message_buffer.write().await;
         buffer.push_back(queued_message.clone());
         while buffer.len() > MAX_BUFFER_LEN {
             buffer.pop_front();
         }
-        tracing::debug!("message buffer now contains {} messages", buffer.len());
         drop(buffer);
         let _ = state.message_tx.send(queued_message);
 
@@ -414,7 +563,94 @@ async fn new_message(
     StatusCode::OK.into_response()
 }
 
-/// Handle incoming websocket connections
+/// Handle SSE connections for message delivery.
+///
+/// Clients connect via GET /endpoint/{did} or GET /messages/{did}.
+/// On connect: replay buffered messages since Last-Event-ID.
+/// Then stream new messages as SSE events with monotonic IDs.
+/// Server sends keepalive comments every 15 seconds to detect dead connections.
+async fn sse_handler(
+    State(state): State<Arc<IntermediaryState>>,
+    Path(did): Path<String>,
+    headers: HeaderMap,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    // Parse Last-Event-ID for replay
+    let last_event_id: Option<u64> = headers
+        .get("Last-Event-ID")
+        .or_else(|| headers.get("last-event-id"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok());
+
+    tracing::info!(
+        "{} SSE client connected for {did}, last_event_id={:?}",
+        state.domain,
+        last_event_id
+    );
+
+    // Register as a subscriber for this DID
+    let mut notify_rx = state.subscribers.lock().await.subscribe(&did);
+
+    // Collect buffered messages to replay
+    let replay_messages = {
+        let buffers = state.buffers.read().await;
+        if let Some(buf) = buffers.get(&did) {
+            buf.messages_after(last_event_id)
+        } else {
+            Vec::new()
+        }
+    };
+
+    if !replay_messages.is_empty() {
+        tracing::info!(
+            "{} replaying {} buffered messages for {did}",
+            state.domain,
+            replay_messages.len()
+        );
+    }
+
+    let state_clone = Arc::clone(&state);
+    let did_clone = did.clone();
+
+    let stream = async_stream::stream! {
+        // Phase 1: Replay buffered messages
+        for msg in replay_messages {
+            let encoded = Base64UrlUnpadded::encode_string(&msg.data);
+            yield Ok(Event::default()
+                .id(msg.id.to_string())
+                .data(encoded));
+        }
+
+        // Phase 2: Stream new messages as they arrive
+        loop {
+            match notify_rx.recv().await {
+                Some(msg_id) => {
+                    let buffers = state_clone.buffers.read().await;
+                    if let Some(buf) = buffers.get(&did_clone) {
+                        if let Some(msg) = buf.messages.iter().find(|m| m.id == msg_id) {
+                            let encoded = Base64UrlUnpadded::encode_string(&msg.data);
+                            yield Ok(Event::default()
+                                .id(msg.id.to_string())
+                                .data(encoded));
+                        }
+                    }
+                }
+                None => {
+                    // Channel closed — subscriber was cleaned up
+                    tracing::debug!("SSE subscriber channel closed for {}", did_clone);
+                    break;
+                }
+            }
+        }
+    };
+
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(SSE_KEEPALIVE_SECS))
+            .text("keepalive")
+    )
+}
+
+/// Handle incoming websocket connections (legacy — kept for backward compatibility)
 async fn websocket_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<IntermediaryState>>,
