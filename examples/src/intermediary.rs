@@ -38,6 +38,18 @@ struct Cli {
     port: u16,
     #[arg(index = 1, help = "e.g. \"p.teaspoon.world\" or \"localhost:3001\"")]
     domain: String,
+    #[arg(
+        long,
+        default_value_t = 86400,
+        help = "Message buffer TTL in seconds (default: 86400 = 24 hours)"
+    )]
+    buffer_ttl: u64,
+    #[arg(
+        long,
+        default_value_t = 2000,
+        help = "Max buffered messages per recipient (default: 2000)"
+    )]
+    buffer_max: usize,
 }
 
 /// A buffered message waiting for delivery via SSE.
@@ -66,7 +78,7 @@ impl RecipientBuffer {
     }
 
     /// Add a message and return its assigned ID.
-    fn push(&mut self, data: Bytes) -> u64 {
+    fn push(&mut self, data: Bytes, max_size: usize) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         self.messages.push_back(BufferedMessage {
@@ -75,7 +87,7 @@ impl RecipientBuffer {
             timestamp: Instant::now(),
         });
         // Trim if over max size
-        while self.messages.len() > MAX_BUFFER_PER_RECIPIENT {
+        while self.messages.len() > max_size {
             self.messages.pop_front();
         }
         id
@@ -164,6 +176,10 @@ struct IntermediaryState {
     buffers: RwLock<HashMap<String, RecipientBuffer>>,
     /// Per-recipient SSE subscriber notifications
     subscribers: Mutex<SseSubscribers>,
+    /// Buffer TTL (configurable via --buffer-ttl)
+    buffer_ttl: Duration,
+    /// Max messages per recipient (configurable via --buffer-max)
+    buffer_max: usize,
     /// Legacy: broadcast for WebSocket handlers (log viewer, backward compat)
     message_tx: broadcast::Sender<QueuedWsMessage>,
     /// Legacy: old flat buffer (kept for backward compat during transition)
@@ -233,8 +249,6 @@ impl IntermediaryState {
 
 const MAX_LOG_LEN: usize = 10;
 const MAX_BUFFER_LEN: usize = 100;
-const MAX_BUFFER_PER_RECIPIENT: usize = 200;
-const BUFFER_TTL_SECS: u64 = 300; // 5 minutes
 const SSE_KEEPALIVE_SECS: u64 = 15;
 
 #[tokio::main]
@@ -263,12 +277,24 @@ async fn main() {
     let db = AsyncSecureStore::new();
     db.add_private_vid(private_vid, None).unwrap();
 
+    let buffer_ttl = Duration::from_secs(args.buffer_ttl);
+    let buffer_max = args.buffer_max;
+
+    tracing::info!(
+        "Buffer config: TTL={}s ({}h), max={} per recipient",
+        args.buffer_ttl,
+        args.buffer_ttl / 3600,
+        buffer_max
+    );
+
     let state = Arc::new(IntermediaryState {
         domain: args.domain.to_owned(),
         did,
         db: RwLock::new(db),
         buffers: RwLock::new(HashMap::new()),
         subscribers: Mutex::new(SseSubscribers::new()),
+        buffer_ttl,
+        buffer_max,
         message_tx: broadcast::channel(100).0,
         message_buffer: RwLock::new(VecDeque::with_capacity(100)),
         log: RwLock::new(VecDeque::with_capacity(MAX_LOG_LEN)),
@@ -279,14 +305,19 @@ async fn main() {
     {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            let ttl = Duration::from_secs(BUFFER_TTL_SECS);
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 let mut buffers = state.buffers.write().await;
+                let mut expired_count = 0;
                 for (_, buf) in buffers.iter_mut() {
-                    buf.expire(ttl);
+                    let before = buf.messages.len();
+                    buf.expire(state.buffer_ttl);
+                    expired_count += before - buf.messages.len();
                 }
                 buffers.retain(|_, buf| !buf.messages.is_empty());
+                if expired_count > 0 {
+                    tracing::debug!("Buffer cleanup: expired {expired_count} messages");
+                }
 
                 // Also cleanup subscriber entries for disconnected clients
                 state.subscribers.lock().await.cleanup();
@@ -377,7 +408,7 @@ async fn new_message(
         let msg_id = {
             let mut buffers = state.buffers.write().await;
             let buf = buffers.entry(receiver.clone()).or_insert_with(RecipientBuffer::new);
-            buf.push(msg_bytes.clone())
+            buf.push(msg_bytes.clone(), state.buffer_max)
         };
 
         // Notify SSE subscribers for this recipient
