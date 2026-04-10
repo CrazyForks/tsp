@@ -331,6 +331,7 @@ async fn main() {
         .route("/transport/{did}", post(new_message).get(sse_handler))
         .route("/endpoint/{did}", post(new_message).get(sse_handler))
         .route("/messages/{did}", get(sse_handler))
+        .route("/ack/{did}", post(ack_handler))
         // Legacy WebSocket endpoint for backward compatibility
         .route("/ws/transport/{did}", get(websocket_handler))
         .route("/ws/endpoint/{did}", get(websocket_handler))
@@ -679,6 +680,60 @@ async fn sse_handler(
             .interval(Duration::from_secs(SSE_KEEPALIVE_SECS))
             .text("keepalive")
     )
+}
+
+/// Handle cumulative acknowledgment from a client.
+///
+/// The client sends `{"up_to_sequence": N}` to indicate it has processed
+/// all messages up to and including sequence N. P deletes those messages
+/// from the recipient's buffer.
+async fn ack_handler(
+    State(state): State<Arc<IntermediaryState>>,
+    Path(did): Path<String>,
+    body: Bytes,
+) -> Response {
+    // Parse the ack body
+    let ack: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("Invalid ack body for {did}: {e}");
+            return (StatusCode::BAD_REQUEST, "invalid JSON").into_response();
+        }
+    };
+
+    let up_to = match ack.get("up_to_sequence").and_then(|v| v.as_u64()) {
+        Some(n) => n,
+        None => {
+            return (StatusCode::BAD_REQUEST, "missing up_to_sequence").into_response();
+        }
+    };
+
+    // Delete acked messages from the recipient buffer
+    let deleted = {
+        let mut buffers = state.buffers.write().await;
+        if let Some(buf) = buffers.get_mut(&did) {
+            let before = buf.messages.len();
+            buf.messages.retain(|m| m.id > up_to);
+            before - buf.messages.len()
+        } else {
+            0
+        }
+    };
+
+    tracing::info!(
+        recipient = %did,
+        up_to_sequence = up_to,
+        deleted = deleted,
+        "Buffer ack received"
+    );
+
+    state
+        .log(format!(
+            "Ack from {did}: up_to_sequence={up_to}, deleted {deleted} messages"
+        ))
+        .await;
+
+    StatusCode::OK.into_response()
 }
 
 /// Handle incoming websocket connections (legacy — kept for backward compatibility)
