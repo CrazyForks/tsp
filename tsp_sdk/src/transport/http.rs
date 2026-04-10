@@ -60,19 +60,36 @@ pub(crate) async fn receive_messages(
     let mut es = reqwest_eventsource::EventSource::get(sse_url.as_str());
 
     Ok(Box::pin(stream! {
+        // Track the highest event ID we've processed for deduplication.
+        // On SSE reconnect, the server replays messages from Last-Event-ID.
+        // Some of those may have already been yielded before the disconnect.
+        // We skip any event with id <= last_processed_id.
+        let mut last_processed_id: Option<u64> = None;
+
         loop {
             match es.next().await {
                 Some(Ok(reqwest_eventsource::Event::Open)) => {
                     tracing::debug!("SSE connection opened to {}", address_owned);
                 }
                 Some(Ok(reqwest_eventsource::Event::Message(msg))) => {
+                    // Deduplication: skip events we've already processed
+                    if let Ok(event_id) = msg.id.parse::<u64>() {
+                        if let Some(last_id) = last_processed_id {
+                            if event_id <= last_id {
+                                tracing::debug!("SSE dedup: skipping event id={} (last_processed={})", event_id, last_id);
+                                continue;
+                            }
+                        }
+                        last_processed_id = Some(event_id);
+                    }
+
                     // SSE event data is CESR-T (base64url) encoded
                     match Base64UrlUnpadded::decode_vec(&msg.data) {
                         Ok(binary) => {
                             yield Ok(BytesMut::from(binary.as_slice()));
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to decode SSE event data: {}", e);
+                            tracing::debug!("SSE event not base64url, treating as raw: {}", e);
                             // Try treating as raw binary (backward compat with non-encoded data)
                             yield Ok(BytesMut::from(msg.data.as_bytes()));
                         }
@@ -83,7 +100,7 @@ pub(crate) async fn receive_messages(
                     tracing::debug!("SSE stream ended, auto-reconnecting");
                 }
                 Some(Err(e)) => {
-                    tracing::warn!("SSE error: {}", e);
+                    tracing::debug!("SSE error: {}", e);
                     // For fatal errors, try falling back to WebSocket
                     if is_fatal_sse_error(&e) {
                         tracing::info!("SSE not supported, falling back to WebSocket");
