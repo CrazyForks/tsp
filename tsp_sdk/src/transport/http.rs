@@ -3,7 +3,13 @@ use async_stream::stream;
 use base64ct::{Base64UrlUnpadded, Encoding};
 use bytes::BytesMut;
 use futures::StreamExt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use url::Url;
+
+/// Shared cursor that the SSE stream updates with the latest event ID.
+/// The application can read this to persist the cursor and send acks.
+pub type SseCursor = Arc<AtomicU64>;
 
 use super::TransportError;
 #[cfg(feature = "use_local_certificate")]
@@ -39,6 +45,47 @@ pub(crate) async fn send_message(tsp_message: &[u8], url: &Url) -> Result<(), Tr
     Ok(())
 }
 
+/// Send a cumulative acknowledgment to the intermediary's buffer.
+///
+/// Tells the intermediary "I have processed all messages up to and including
+/// this sequence number. You may delete them."
+///
+/// The `address` should be the intermediary's base URL (e.g., https://p.teaspoon.world).
+/// The `recipient_did` identifies which recipient queue to ack.
+pub(crate) async fn send_ack(
+    address: &Url,
+    recipient_did: &str,
+    up_to_sequence: u64,
+) -> Result<(), TransportError> {
+    let mut ack_url = address.clone();
+    ack_url.set_path(&format!("/ack/{}", recipient_did));
+
+    let client = crate::http_client::reqwest_client()
+        .map_err(|e| TransportError::Http(e.context.to_string(), e.source))?;
+
+    let body = format!("{{\"up_to_sequence\":{}}}", up_to_sequence);
+
+    let response = client
+        .post(ack_url.clone())
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| TransportError::Http(ack_url.to_string(), e))?;
+
+    if let Err(e) = response.error_for_status_ref() {
+        return Err(TransportError::Http(ack_url.to_string(), e));
+    }
+
+    tracing::debug!(
+        recipient = %recipient_did,
+        up_to_sequence = up_to_sequence,
+        "Buffer ack sent"
+    );
+
+    Ok(())
+}
+
 /// Receive messages via Server-Sent Events (SSE).
 ///
 /// Opens a GET request with `Accept: text/event-stream` to the transport URL.
@@ -49,30 +96,71 @@ pub(crate) async fn send_message(tsp_message: &[u8], url: &Url) -> Result<(), Tr
 /// Falls back to WebSocket if SSE is not supported by the server.
 pub(crate) async fn receive_messages(
     address: &Url,
+    last_event_id: Option<&str>,
 ) -> Result<TSPStream<BytesMut, TransportError>, TransportError> {
-    // Try SSE first — this is the preferred transport for intermediary mode.
-    // The URL is used as-is for SSE (no scheme conversion needed, unlike WebSocket).
+    let (stream, _cursor) = receive_messages_tracked(address, last_event_id).await?;
+    Ok(stream)
+}
+
+/// Receive messages and return a shared cursor that tracks the latest event ID.
+/// The caller can read the cursor to persist it and send acks.
+pub async fn receive_messages_tracked(
+    address: &Url,
+    last_event_id: Option<&str>,
+) -> Result<(TSPStream<BytesMut, TransportError>, SseCursor), TransportError> {
     let sse_url = address.clone();
     let address_owned = address.clone();
+    let initial_cursor: Option<u64> = last_event_id.and_then(|s| s.parse::<u64>().ok());
+    let cursor_str = last_event_id.map(|s| s.to_string());
+
+    // Shared cursor — updated by the stream, readable by the caller
+    let cursor = Arc::new(AtomicU64::new(initial_cursor.unwrap_or(0)));
+    let cursor_for_stream = Arc::clone(&cursor);
 
     tracing::debug!("Opening SSE connection to {}", sse_url);
 
-    let mut es = reqwest_eventsource::EventSource::get(sse_url.as_str());
+    // Build the SSE request, optionally with Last-Event-ID for cursor resume
+    let mut es = if let Some(ref cursor_val) = cursor_str {
+        tracing::debug!("SSE resuming from Last-Event-ID: {}", cursor_val);
+        let client = crate::http_client::reqwest_client()
+            .map_err(|e| TransportError::Http(e.context.to_string(), e.source))?;
+        let request = client
+            .get(sse_url.as_str())
+            .header("Last-Event-ID", cursor_val.as_str());
+        reqwest_eventsource::EventSource::new(request)
+            .map_err(|e| TransportError::InvalidMessageReceived(format!("SSE init error: {}", e)))?
+    } else {
+        reqwest_eventsource::EventSource::get(sse_url.as_str())
+    };
 
-    Ok(Box::pin(stream! {
+    let stream = Box::pin(stream! {
+        let mut last_processed_id: Option<u64> = initial_cursor;
+
         loop {
             match es.next().await {
                 Some(Ok(reqwest_eventsource::Event::Open)) => {
                     tracing::debug!("SSE connection opened to {}", address_owned);
                 }
                 Some(Ok(reqwest_eventsource::Event::Message(msg))) => {
+                    // Deduplication: skip events we've already processed
+                    if let Ok(event_id) = msg.id.parse::<u64>() {
+                        if let Some(last_id) = last_processed_id
+                            && event_id <= last_id
+                        {
+                            tracing::debug!("SSE dedup: skipping event id={} (last_processed={})", event_id, last_id);
+                            continue;
+                        }
+                        last_processed_id = Some(event_id);
+                        cursor_for_stream.store(event_id, Ordering::Relaxed);
+                    }
+
                     // SSE event data is CESR-T (base64url) encoded
                     match Base64UrlUnpadded::decode_vec(&msg.data) {
                         Ok(binary) => {
                             yield Ok(BytesMut::from(binary.as_slice()));
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to decode SSE event data: {}", e);
+                            tracing::debug!("SSE event not base64url, treating as raw: {}", e);
                             // Try treating as raw binary (backward compat with non-encoded data)
                             yield Ok(BytesMut::from(msg.data.as_bytes()));
                         }
@@ -83,7 +171,7 @@ pub(crate) async fn receive_messages(
                     tracing::debug!("SSE stream ended, auto-reconnecting");
                 }
                 Some(Err(e)) => {
-                    tracing::warn!("SSE error: {}", e);
+                    tracing::debug!("SSE error: {}", e);
                     // For fatal errors, try falling back to WebSocket
                     if is_fatal_sse_error(&e) {
                         tracing::info!("SSE not supported, falling back to WebSocket");
@@ -114,7 +202,9 @@ pub(crate) async fn receive_messages(
         while let Some(result) = ws_stream.next().await {
             yield result;
         }
-    }))
+    });
+
+    Ok((stream, cursor))
 }
 
 /// Open a WebSocket connection (fallback for servers that don't support SSE).
