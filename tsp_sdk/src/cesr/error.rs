@@ -1,40 +1,39 @@
 /// An error type to indicate something went wrong with encoding
-#[derive(Clone, Copy, Debug)]
+#[derive(thiserror::Error, Clone, Copy, Debug)]
 pub enum EncodeError {
+    #[error("field size exceeds maximum CESR encoding limit")]
     ExcessiveFieldSize,
+    #[error("hops field is required but missing")]
     MissingHops,
+    #[error("receiver is required but missing")]
     MissingReceiver,
+    #[error("VID is not valid for CESR encoding")]
     InvalidVid,
 }
 
 /// An error type to indicate something went wrong with decoding
-#[derive(Clone, Copy, Debug)]
+#[derive(thiserror::Error, Clone, Copy, Debug)]
 pub enum DecodeError {
+    #[error("unexpected data encountered while decoding")]
     UnexpectedData,
+    #[error("unexpected message type")]
     UnexpectedMsgType,
+    #[error("trailing garbage after decoded message")]
     TrailingGarbage,
+    #[error("signature verification failed")]
     SignatureError,
+    #[error("VID error while decoding")]
     VidError,
+    #[error("CESR version mismatch")]
     VersionMismatch,
+    #[error("invalid crypto type")]
     InvalidCryptoType,
+    #[error("invalid signature type")]
     InvalidSignatureType,
+    #[error("hops field is required but missing")]
     MissingHops,
+    #[error("unknown crypto algorithm")]
     UnknownCrypto,
+    #[error("invalid crypto payload")]
     InvalidCrypto,
 }
-
-impl std::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
-        write!(f, "{self:?}")
-    }
-}
-
-impl std::fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
-        write!(f, "{self:?}")
-    }
-}
-
-impl std::error::Error for EncodeError {}
-
-impl std::error::Error for DecodeError {}
