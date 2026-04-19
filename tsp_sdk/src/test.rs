@@ -3,7 +3,6 @@ use crate::{
     ReceivedRelationshipForm, RelationshipStatus, SecureStorage, VerifiedVid, test_utils::*,
 };
 use futures::StreamExt;
-use std::collections::BTreeMap;
 
 #[tokio::test]
 #[serial_test::serial(tcp)]
@@ -792,55 +791,6 @@ async fn test_persisted_store_roundtrip_reopens_dirty_wallet() {
     assert!(!sealed_message.is_empty());
 }
 
-fn relationship_status_signature(status: RelationshipStatus) -> String {
-    match status {
-        RelationshipStatus::_Controlled => "Controlled".to_string(),
-        RelationshipStatus::Unrelated => "Unrelated".to_string(),
-        RelationshipStatus::Unidirectional { thread_id } => format!("Uni:{thread_id:?}"),
-        RelationshipStatus::ReverseUnidirectional { thread_id } => format!("RevUni:{thread_id:?}"),
-        RelationshipStatus::Bidirectional {
-            thread_id,
-            remote_thread_id,
-            outstanding_nested_requests,
-        } => format!("Bi:{thread_id:?}:{remote_thread_id:?}:{outstanding_nested_requests:?}"),
-    }
-}
-
-fn export_snapshot(
-    store: &AsyncSecureStore,
-) -> (
-    BTreeMap<String, String>,
-    Vec<String>,
-    BTreeMap<String, String>,
-) {
-    let (vids, aliases, keys) = store.export().unwrap();
-    let mut vid_rows = vids
-        .into_iter()
-        .map(|exported| {
-            format!(
-                "{}|{}|{}|{}|{}",
-                exported.id,
-                exported.is_private(),
-                exported.relation_vid.unwrap_or_default(),
-                exported.parent_vid.unwrap_or_default(),
-                relationship_status_signature(exported.relation_status)
-            )
-        })
-        .collect::<Vec<_>>();
-    vid_rows.sort();
-
-    let key_rows = keys
-        .into_iter()
-        .map(|(k, v)| (k, format!("{v:?}")))
-        .collect::<BTreeMap<_, _>>();
-
-    (
-        aliases.into_iter().collect::<BTreeMap<_, _>>(),
-        vid_rows,
-        key_rows,
-    )
-}
-
 fn setup_transition_pair() -> (AsyncSecureStore, String, AsyncSecureStore, String) {
     let a_store = create_async_test_store();
     let b_store = create_async_test_store();
@@ -896,6 +846,169 @@ async fn test_dirty_roundtrip_multi_reopen_idempotent() {
     assert_eq!(
         reopened.get_secret_key("test-history-key-2").unwrap(),
         Some(vec![5, 6, 7, 8])
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test]
+#[serial_test::serial(tcp)]
+async fn test_routed_delivery_after_reopen_uses_persisted_route_metadata() {
+    let topology = create_routed_dirty_topology();
+    let fixture_sender = create_persisted_store().await;
+    let fixture_intermediary = create_persisted_store().await;
+    let fixture_receiver = create_persisted_store().await;
+
+    let sender_baseline = export_snapshot(&topology.sender);
+    let sender = persist_reopen_cycle(&topology.sender, &fixture_sender, 1).await;
+    let intermediary = persist_reopen_cycle(&topology.intermediary, &fixture_intermediary, 1).await;
+    let receiver = persist_reopen_cycle(&topology.receiver, &fixture_receiver, 1).await;
+    assert_eq!(sender_baseline, export_snapshot(&sender));
+
+    let mut intermediary_messages = intermediary
+        .receive(&topology.intermediary_vid)
+        .await
+        .unwrap();
+    let mut receiver_messages = receiver.receive(&topology.receiver_vid).await.unwrap();
+
+    sender
+        .send(
+            &topology.sender_vid,
+            &topology.receiver_vid,
+            None,
+            b"dirty-routed-message",
+        )
+        .await
+        .unwrap();
+
+    let crate::ReceivedTspMessage::ForwardRequest {
+        sender: forwarded_sender,
+        receiver: forwarded_receiver,
+        next_hop,
+        route,
+        opaque_payload,
+    } = intermediary_messages.next().await.unwrap().unwrap()
+    else {
+        panic!("intermediary did not receive routed forward request");
+    };
+    assert_eq!(forwarded_sender, topology.sender_vid);
+    assert_eq!(forwarded_receiver, topology.intermediary_vid);
+    assert_eq!(next_hop, topology.intermediary_vid);
+    assert!(route.is_empty());
+
+    let intermediary = persist_reopen_cycle(&intermediary, &fixture_intermediary, 1).await;
+    intermediary
+        .forward_routed_message(&next_hop, route, &opaque_payload)
+        .await
+        .unwrap();
+
+    let crate::ReceivedTspMessage::GenericMessage {
+        sender,
+        message,
+        message_type,
+        ..
+    } = receiver_messages.next().await.unwrap().unwrap()
+    else {
+        panic!("receiver did not receive forwarded routed payload");
+    };
+
+    assert_eq!(sender, topology.sender_vid);
+    assert_eq!(message.iter().as_slice(), b"dirty-routed-message");
+    assert_ne!(message_type.crypto_type, crate::cesr::CryptoType::Plaintext);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test]
+#[serial_test::serial(tcp)]
+async fn test_routed_failure_path_after_reopen_keeps_snapshot_stable() {
+    let topology = create_routed_dirty_topology();
+    let fixture_sender = create_persisted_store().await;
+    let fixture_intermediary = create_persisted_store().await;
+
+    let sender = persist_reopen_cycle(&topology.sender, &fixture_sender, 1).await;
+    let intermediary = persist_reopen_cycle(&topology.intermediary, &fixture_intermediary, 1).await;
+
+    let mut intermediary_messages = intermediary
+        .receive(&topology.intermediary_vid)
+        .await
+        .unwrap();
+    sender
+        .send(
+            &topology.sender_vid,
+            &topology.receiver_vid,
+            None,
+            b"dirty-routed-message",
+        )
+        .await
+        .unwrap();
+
+    let crate::ReceivedTspMessage::ForwardRequest { opaque_payload, .. } =
+        intermediary_messages.next().await.unwrap().unwrap()
+    else {
+        panic!("intermediary did not receive routed message before failure-path test");
+    };
+
+    let intermediary = persist_reopen_cycle(&intermediary, &fixture_intermediary, 1).await;
+    let baseline = export_snapshot(&intermediary);
+    let err = intermediary
+        .forward_routed_message(
+            "did:peer:missing-next-hop",
+            vec![b"did:peer:tail-hop"],
+            &opaque_payload,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::Error::UnresolvedNextHop(_)));
+
+    let intermediary = persist_reopen_cycle(&intermediary, &fixture_intermediary, 1).await;
+    assert_eq!(baseline, export_snapshot(&intermediary));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test]
+async fn test_high_entropy_dirty_store_multi_reopen_consistency() {
+    let (store, seed) = create_high_entropy_dirty_store();
+    let fixture = create_persisted_store().await;
+
+    let baseline = export_snapshot(&store);
+    let reopened = persist_reopen_cycle(&store, &fixture, 3).await;
+    assert_eq!(baseline, export_snapshot(&reopened));
+
+    assert_eq!(
+        reopened
+            .resolve_alias("high-entropy-root")
+            .unwrap()
+            .as_deref(),
+        Some(seed.local_vid.as_str())
+    );
+    assert!(
+        reopened
+            .get_secret_key("high-entropy-key-00")
+            .unwrap()
+            .is_some()
+    );
+
+    let RelationshipStatus::Bidirectional { .. } = reopened
+        .get_relation_status_for_vid_pair(&seed.local_vid, &seed.bidirectional_remote_vid)
+        .unwrap()
+    else {
+        panic!("expected bidirectional relationship missing after reopen");
+    };
+
+    let (_endpoint, sealed_message) = reopened
+        .seal_message(
+            &seed.local_vid,
+            &seed.bidirectional_remote_vid,
+            None,
+            b"high-entropy-persisted-message",
+        )
+        .unwrap();
+    assert!(!sealed_message.is_empty());
+    let (_aliases, vid_rows, _keys) = export_snapshot(&reopened);
+    assert!(
+        vid_rows
+            .iter()
+            .any(|row| row.starts_with(&seed.routed_remote_vid) && row.contains('>')),
+        "expected routed remote entry to retain tunnel metadata"
     );
 }
 
