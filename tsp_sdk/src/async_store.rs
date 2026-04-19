@@ -173,10 +173,17 @@ impl AsyncSecureStore {
         self.inner.set_alias(alias, did)
     }
 
+    /// Store a raw secret key identified by `kid`.
+    ///
+    /// Used for managing auxiliary signing keys that are not bound to a VID,
+    /// for example WebVH pre-commit key material or TMCP signing keys.
     pub fn add_secret_key(&self, kid: String, secret_key: Vec<u8>) -> Result<(), Error> {
         self.inner.add_secret_key(kid, secret_key)
     }
 
+    /// Retrieve a previously stored raw secret key by `kid`.
+    ///
+    /// Returns `None` if no key is stored under `kid`.
     pub fn get_secret_key(&self, kid: &str) -> Result<Option<Vec<u8>>, Error> {
         self.inner.get_secret_key(kid)
     }
@@ -259,6 +266,14 @@ impl AsyncSecureStore {
         Ok(())
     }
 
+    /// Build a relationship request message without transmitting it.
+    ///
+    /// Returns `(endpoint, message)` where `endpoint` is the receiver's transport
+    /// URL and `message` is the sealed, CESR-encoded TSP request ready to send.
+    ///
+    /// Use this instead of [`AsyncSecureStore::send_relationship_request`] when
+    /// you need to transmit over a custom transport (e.g., Matrix, A2A, or any
+    /// non-HTTP channel). The receiver VID must be publicly discoverable.
     pub fn make_relationship_request(
         &self,
         sender: &str,
@@ -313,6 +328,13 @@ impl AsyncSecureStore {
         Ok(())
     }
 
+    /// Build a parallel relationship request message without transmitting it.
+    ///
+    /// Returns `(endpoint, message)`. Requires an existing bidirectional
+    /// relationship between `sender` and `receiver` as a referral channel.
+    ///
+    /// Use this instead of [`AsyncSecureStore::send_parallel_relationship_request`]
+    /// when you need to transmit over a custom transport.
     pub fn make_parallel_relationship_request(
         &self,
         sender: &str,
@@ -340,6 +362,13 @@ impl AsyncSecureStore {
         Ok(())
     }
 
+    /// Build a relationship acceptance message without transmitting it.
+    ///
+    /// `thread_id` must match the one received in the corresponding relationship
+    /// request. Returns `(endpoint, message)`.
+    ///
+    /// Use this instead of [`AsyncSecureStore::send_relationship_accept`] when
+    /// you need to transmit over a custom transport.
     pub fn make_relationship_accept(
         &self,
         sender: &str,
@@ -371,6 +400,12 @@ impl AsyncSecureStore {
         Ok(())
     }
 
+    /// Build a parallel relationship acceptance message without transmitting it.
+    ///
+    /// Returns `(endpoint, message)`.
+    ///
+    /// Use this instead of [`AsyncSecureStore::send_parallel_relationship_accept`]
+    /// when you need to transmit over a custom transport.
     pub fn make_parallel_relationship_accept(
         &self,
         sender_new_vid: &str,
@@ -400,6 +435,12 @@ impl AsyncSecureStore {
         Ok(())
     }
 
+    /// Build a relationship cancellation message without transmitting it.
+    ///
+    /// Returns `(endpoint, message)`.
+    ///
+    /// Use this instead of [`AsyncSecureStore::send_relationship_cancel`] when
+    /// you need to transmit over a custom transport.
     pub fn make_relationship_cancel(
         &self,
         sender: &str,
@@ -424,6 +465,14 @@ impl AsyncSecureStore {
         Ok(())
     }
 
+    /// Build a nested relationship request message without transmitting it.
+    ///
+    /// Creates a new nested VID under `parent_sender` for private communication
+    /// with `receiver`. Returns `((endpoint, message), nested_vid)` where
+    /// `nested_vid` is the newly generated nested VID to track locally.
+    ///
+    /// Use this instead of [`AsyncSecureStore::send_nested_relationship_request`]
+    /// when you need to transmit over a custom transport.
     pub fn make_nested_relationship_request(
         &self,
         parent_sender: &str,
@@ -450,6 +499,14 @@ impl AsyncSecureStore {
         Ok(vid)
     }
 
+    /// Build a nested relationship acceptance message without transmitting it.
+    ///
+    /// Generates a new nested VID under `parent_sender` to pair with the
+    /// requester's nested VID. `thread_id` must match the one received in
+    /// the nested relationship request. Returns `((endpoint, message), nested_vid)`.
+    ///
+    /// Use this instead of [`AsyncSecureStore::send_nested_relationship_accept`]
+    /// when you need to transmit over a custom transport.
     pub fn make_nested_relationship_accept(
         &self,
         parent_sender: &str,
@@ -480,6 +537,13 @@ impl AsyncSecureStore {
         Ok(vid)
     }
 
+    /// Build the next forwarding hop of a routed message without transmitting it.
+    ///
+    /// Wraps `opaque_message` for forwarding to `next_hop`, stripping the first
+    /// entry from `path`. Returns `(endpoint, message)`.
+    ///
+    /// Use this instead of [`AsyncSecureStore::forward_routed_message`] when
+    /// you need to transmit over a custom transport.
     pub fn make_next_routed_message(
         &self,
         next_hop: &str,
