@@ -183,7 +183,7 @@ pub fn decode_count(identifier: u16, stream: &mut &[u8]) -> Option<u32> {
         let next = extract_triplet(stream.get(3..=5)?.try_into().unwrap());
         *stream = &stream[6..];
 
-        Some(index << 24 | next)
+        Some((index & 0x3F) << 24 | next)
     } else {
         None
     }

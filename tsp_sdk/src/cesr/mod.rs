@@ -431,4 +431,49 @@ ACTD7NDX93ZGTkZBBuSeSGsAQ7u0hngpNTZTK_Um7rUZGnLRNJvo5oOnnC1J2iBQHuxoq8PyjdT3BHS2
         assert_eq!(decode_indexed_data::<64>(0, slice).unwrap().0, 1);
         assert_eq!(decode_indexed_data::<64>(0, slice).unwrap().0, 2);
     }
+
+    #[test]
+    fn decode_count_long_form_round_trips() {
+        // All counts below 4096 use the short 3-byte form; counts >= 4096 use the
+        // long 6-byte form where the header word encodes both the identifier and the
+        // upper 6 bits of the count.  Previously, decode_count returned
+        // `index << 24 | next` where `index` still contained the identifier bits,
+        // producing an overflow / wrong result for every non-zero identifier.
+        //
+        // Identifiers mirror the real TSP framing codes used in packet.rs:
+        //   4  = TSP_ETS_WRAPPER ("E")
+        //   9  = TSP_HOP_LIST    ("J")
+        //   18 = TSP_S_WRAPPER   ("S")
+        //   25 = TSP_PAYLOAD     ("Z")
+        let cases: &[(u16, u32)] = &[
+            (4, 4096),        // TSP_ETS_WRAPPER, exact long-form boundary
+            (4, 65_536),      // TSP_ETS_WRAPPER, larger count
+            (9, 4096),        // TSP_HOP_LIST, exact long-form boundary
+            (9, 100_000),     // TSP_HOP_LIST, larger count
+            (18, 4096),       // TSP_S_WRAPPER, exact long-form boundary
+            (18, 1_000_000),  // TSP_S_WRAPPER, larger count
+            (25, 4096),       // TSP_PAYLOAD, exact long-form boundary
+            (25, 16_777_215), // TSP_PAYLOAD, max 24-bit payload count
+        ];
+        for &(identifier, count) in cases {
+            let mut stream = Vec::new();
+            encode_count(identifier, count as usize, &mut stream);
+            assert_eq!(
+                stream.len(),
+                6,
+                "identifier={identifier} count={count}: expected 6-byte long form"
+            );
+            let mut slice = stream.as_slice();
+            let decoded = decode_count(identifier, &mut slice);
+            assert_eq!(
+                decoded,
+                Some(count),
+                "identifier={identifier} count={count}: decoded {decoded:?}"
+            );
+            assert!(
+                slice.is_empty(),
+                "stream should be fully consumed after decode"
+            );
+        }
+    }
 }
