@@ -5,8 +5,6 @@ pub enum EncodeError {
     ExcessiveFieldSize,
     #[error("hops field is required but missing")]
     MissingHops,
-    #[error("receiver is required but missing")]
-    MissingReceiver,
     #[error("VID is not valid for CESR encoding")]
     InvalidVid,
     #[error("invalid signature type")]

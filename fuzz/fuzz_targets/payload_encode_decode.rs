@@ -11,11 +11,18 @@ fuzz_target!(|data: cesr::fuzzing::Wrapper| {
 
             assert_eq!(data, result.payload);
         }
-        Err(cesr::error::EncodeError::MissingHops) => match &data.0 {
-            cesr::Payload::RoutedMessage(route, _) => assert!(route.is_empty()),
-            _ => todo!(),
-        },
+        // MissingHops is only raised for RoutedMessage with an empty hop list
+        Err(cesr::error::EncodeError::MissingHops) => {
+            assert!(matches!(
+                &data.0,
+                cesr::Payload::RoutedMessage(route, _) if route.is_empty()
+            ));
+        }
+        // Fields that exceed the CESR variable-data size limit are legitimately rejected
+        Err(cesr::error::EncodeError::ExcessiveFieldSize) => {}
+        // Parallel-relation payloads with an empty new_vid are legitimately rejected
         Err(cesr::error::EncodeError::InvalidVid) => {}
-        _ => todo!(),
+        // Any other error is not expected from encode_payload — surface it as a finding
+        Err(e) => panic!("unexpected encode error: {e:?}"),
     }
 });
