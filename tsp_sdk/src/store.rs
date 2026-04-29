@@ -474,7 +474,7 @@ impl SecureStore {
         route: impl IntoIterator<Item: ToString, IntoIter: ExactSizeIterator<Item = impl Display>>,
     ) -> Result<(), Error> {
         let route = route.into_iter();
-        if route.len() == 1 {
+        if route.len() < 2 {
             return Err(Error::InvalidRoute(
                 "A route must have at least two VIDs".into(),
             ));
@@ -3344,6 +3344,39 @@ mod test {
         assert_ne!(
             message_type.signature_type,
             crate::cesr::SignatureType::NoSignature
+        );
+    }
+
+    #[test]
+    #[wasm_bindgen_test]
+    fn test_set_route_for_vid_rejects_empty_route() {
+        let store = create_test_store();
+        let bob = create_test_vid();
+        store
+            .add_verified_vid(bob.vid().clone(), None)
+            .expect("should add verified vid");
+
+        let result = store.set_route_for_vid(bob.identifier(), &[] as &[&str]);
+        assert!(
+            matches!(result, Err(Error::InvalidRoute(_))),
+            "empty route must be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    #[wasm_bindgen_test]
+    fn test_set_route_for_vid_rejects_single_hop() {
+        let store = create_test_store();
+        let bob = create_test_vid();
+        let intermediary = create_test_vid();
+        store
+            .add_verified_vid(bob.vid().clone(), None)
+            .expect("should add verified vid");
+
+        let result = store.set_route_for_vid(bob.identifier(), &[intermediary.identifier()]);
+        assert!(
+            matches!(result, Err(Error::InvalidRoute(_))),
+            "single-hop route must be rejected, got: {result:?}"
         );
     }
 }
