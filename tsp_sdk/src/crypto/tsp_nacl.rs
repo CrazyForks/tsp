@@ -125,7 +125,7 @@ pub(crate) fn seal(
     // aad not yet supported: https://github.com/RustCrypto/nacl-compat/blob/78b59261458923740724c84937459f0a6017a592/crypto_box/src/lib.rs#L227
     let tag = sender_box.encrypt_in_place_detached(&nonce, &[], &mut cesr_message);
 
-    cesr_message.extend(tag.unwrap());
+    cesr_message.extend(tag?);
     cesr_message.extend(nonce);
 
     // encode and append the ciphertext to the envelope data
